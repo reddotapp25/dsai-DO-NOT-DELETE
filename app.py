@@ -1,6 +1,6 @@
 #flask
 
-from flask import Flask, render_template, request
+from flask import Flask, render_template, request, render_template_string
 import joblib
 import os
 from groq import Groq
@@ -18,6 +18,20 @@ import datetime
 client = Groq()
 
 app = Flask(__name__)
+application = app  # This creates a reference AWS can find easily
+
+# --- NEW: Load Guardrail Model ---
+# Ensure compliance_guardrail.pkl is uploaded to AWS with this file
+guardrail_model = joblib.load("compliance_guardrail.pkl")
+
+def init_audit_db():
+    conn = sqlite3.connect("user.db")
+    c = conn.cursor()
+    c.execute('CREATE TABLE IF NOT EXISTS audit_log (query TEXT, risk_level TEXT, timestamp TEXT)')
+    conn.commit()
+    conn.close()
+
+init_audit_db()
 
 @app.route("/",methods=["GET","POST"])
 def index():
@@ -58,6 +72,21 @@ def llama():
 @app.route("/llama_result",methods=["GET","POST"])
 def llama_result():
     q = request.form.get("q")
+
+# --- NEW: Guardrail Logic ---
+    risk_status = guardrail_model.predict([q])[0]
+    
+    if risk_status == "RISK":
+        # Log to the audit table
+        t = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        conn = sqlite3.connect("user.db")
+        c = conn.cursor()
+        c.execute('INSERT INTO audit_log (query, risk_level, timestamp) VALUES(?,?,?)', (q, "HIGH", t))
+        conn.commit()
+        conn.close()
+        return "⚠️ Security Alert: Your query has been flagged for policy violations and logged."
+
+
     r = client.chat.completions.create(
     model="llama-3.1-8b-instant",
     messages=[
@@ -93,6 +122,38 @@ def deletelog():
     c.close()
     conn.close()
     return(render_template("deletelog.html"))
+
+# --- NEW: Security Dashboard for CSO ---
+@app.route("/security_dashboard")
+def security_dashboard():
+    conn = sqlite3.connect("user.db")
+    c = conn.cursor()
+    c.execute("SELECT * FROM audit_log ORDER BY timestamp DESC LIMIT 5")
+    logs = c.fetchall()
+    conn.close()
+    
+    analysis = "No recent threats."
+    if logs:
+        # Use AI to summarize the threats
+        summary_prompt = f"Summarize these blocked security logs in one sentence: {str(logs)}"
+        r = client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[{"role": "user", "content": summary_prompt}]
+        )
+        analysis = r.choices[0].message.content
+
+    # Simple inline dashboard
+    html = f"""
+    <h2>🛡️ Security Dashboard</h2>
+    <p><strong>AI Threat Summary:</strong> {analysis}</p>
+    <table border="1">
+        <tr><th>Timestamp</th><th>Query</th><th>Risk</th></tr>
+        {''.join([f"<tr><td>{l[2]}</td><td>{l[0]}</td><td>{l[1]}</td></tr>" for l in logs])}
+    </table>
+    <br><a href="/">Back to Home</a>
+    """
+    return render_template_string(html)
+
 
 if __name__ == "__main__":
     app.run()

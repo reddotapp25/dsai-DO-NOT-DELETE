@@ -5,3 +5,4 @@ joblib
 groq
 dotenv
 pysqlite3
+pandas
